@@ -27,6 +27,16 @@ CLAUDE_API_KEY  = os.environ.get("CLAUDE_API_KEY", "sk-UiZRa8dkAviifENhYP6sLhSp6
 CLAUDE_MODEL    = os.environ.get("CLAUDE_MODEL", "gpt-5.4-low")
 MEMORY_BASE     = "https://claude-proxy.haichen940607.workers.dev"
 MEMORY_TOKEN    = os.environ.get("MEMORY_TOKEN", "mem_hguo94")
+
+# Image generation keywords (Chinese + English)
+IMAGE_KEYWORDS = [
+    "生成图", "画一张", "画一幅", "帮我画", "生成一张", "生成一幅",
+    "画个", "画出", "生成图片", "生成图像", "create image", "generate image",
+    "draw ", "画 ", "画:",
+]
+
+# Whisper STT API
+WHISPER_API = f"{CLAUDE_API_BASE}/audio/transcriptions"
 PORT = int(os.environ.get("PORT", 10000))
 
 # Pre-authorized credentials (set via env var BOT_TOKEN to override)
@@ -206,40 +216,244 @@ def self_ping_loop():
             pass
 
 
+# ── Image generation & hosting ────────────────────────────────────────────────
+def upload_to_catbox(img_bytes: bytes) -> str:
+    """Upload image bytes to catbox.moe (free, no auth). Returns public URL."""
+    try:
+        r = httpx.post(
+            "https://catbox.moe/user/api.php",
+            data={"reqtype": "fileupload"},
+            files={"fileToUpload": ("image.png", img_bytes, "image/png")},
+            timeout=30,
+        )
+        if r.status_code == 200 and r.text.startswith("https://"):
+            return r.text.strip()
+    except Exception as e:
+        log.warning("catbox upload failed: %s", e)
+    return ""
+
+
+def upload_to_cf_worker(b64: str) -> str:
+    """Upload base64 image to CF Worker /upload-image endpoint. Returns URL or empty."""
+    try:
+        up = httpx.post(
+            f"{MEMORY_BASE}/upload-image",
+            json={"token": MEMORY_TOKEN, "data": b64, "ext": "png"},
+            timeout=15,
+        )
+        if up.status_code == 200:
+            return up.json().get("url", "")
+    except Exception as e:
+        log.warning("cf worker upload failed: %s", e)
+    return ""
+
+
+def generate_and_upload_image(prompt: str) -> str:
+    """Generate image via gpt-image-2, upload to image host, return public URL."""
+    try:
+        log.info("Generating image for prompt: %.80s", prompt)
+        r = httpx.post(
+            f"{CLAUDE_API_BASE}/images/generations",
+            headers={"Authorization": f"Bearer {CLAUDE_API_KEY}", "Content-Type": "application/json"},
+            json={"model": "gpt-image-2", "prompt": prompt, "n": 1,
+                  "size": "1024x1024", "quality": "medium", "response_format": "b64_json"},
+            timeout=120,
+        )
+        r.raise_for_status()
+        b64 = r.json()["data"][0]["b64_json"]
+
+        # Try CF Worker first (works if updated worker is deployed)
+        url = upload_to_cf_worker(b64)
+        if url:
+            log.info("Image on CF Worker: %s", url)
+            return url
+
+        # Fallback: catbox.moe
+        import base64 as _b64
+        url = upload_to_catbox(_b64.b64decode(b64))
+        if url:
+            log.info("Image on catbox: %s", url)
+            return url
+
+        log.error("All image upload methods failed")
+        return ""
+    except Exception as e:
+        log.error("generate_and_upload_image error: %s", e)
+        return ""
+
+
+def transcribe_voice(audio_url: str) -> str:
+    """Download voice file and transcribe via Whisper."""
+    try:
+        # Download audio
+        audio_resp = httpx.get(audio_url, timeout=30, follow_redirects=True)
+        audio_resp.raise_for_status()
+        audio_bytes = audio_resp.content
+        # Call Whisper API (multipart form)
+        files = {"file": ("audio.mp3", audio_bytes, "audio/mpeg")}
+        data  = {"model": "whisper-1"}
+        r = httpx.post(
+            WHISPER_API,
+            headers={"Authorization": f"Bearer {CLAUDE_API_KEY}"},
+            files=files,
+            data=data,
+            timeout=60,
+        )
+        r.raise_for_status()
+        text = r.json().get("text", "")
+        log.info("Transcribed: %.80s", text)
+        return text
+    except Exception as e:
+        log.error("transcribe_voice error: %s", e)
+        return ""
+
+
+def ask_claude_vision(image_url: str, user_text: str = "", system_prompt: str = "") -> str:
+    """Call GPT with an image URL (vision)."""
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    content = []
+    if user_text:
+        content.append({"type": "text", "text": user_text or "请描述这张图片"})
+    content.append({"type": "image_url", "image_url": {"url": image_url}})
+    messages.append({"role": "user", "content": content})
+    try:
+        r = httpx.post(
+            f"{CLAUDE_API_BASE}/chat/completions",
+            headers={"Authorization": f"Bearer {CLAUDE_API_KEY}", "Content-Type": "application/json"},
+            json={"model": CLAUDE_MODEL, "max_tokens": 1024, "messages": messages},
+            timeout=60,
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        log.error("ask_claude_vision error: %s", e)
+        return "[图片理解失败，请稍后重试]"
+
+
+def extract_items(msg: dict):
+    """Return list of (type, sub_item_dict) from item_list."""
+    items = []
+    for item in msg.get("item_list") or []:
+        t = item.get("type")
+        items.append((t, item))
+    return items
+
+
 # ── Message handler ───────────────────────────────────────────────────────────
 def handle_message(msg: dict):
-    """Process one incoming iLink message and reply."""
+    """Process one incoming iLink message and reply (text / image / voice)."""
     log.info("incoming msg: %s", msg)
     try:
-        # Extract text from item_list
-        text = ""
-        for item in msg.get("item_list") or []:
-            if item.get("type") == 1:
-                text = (item.get("text_item") or {}).get("text", "")
-                break
-        if not text:
-            log.info("Skipping non-text message")
-            return
-
         from_user = (
-            msg.get("from_user_id")
-            or msg.get("sender_id")
-            or msg.get("from_id")
-            or ""
+            msg.get("from_user_id") or msg.get("sender_id") or msg.get("from_id") or ""
         )
         ctx_token = (
-            msg.get("context_token")
-            or msg.get("contextToken")
-            or ""
+            msg.get("context_token") or msg.get("contextToken") or ""
         )
+        items = extract_items(msg)
+        log.info("msg items types: %s", [t for t, _ in items])
+
+        # ── Voice message (type 34 in WeChat, or check for voice_item) ────────
+        voice_url = None
+        for t, item in items:
+            vi = item.get("voice_item") or item.get("voiceItem") or {}
+            if vi.get("url") or vi.get("voice_url"):
+                voice_url = vi.get("url") or vi.get("voice_url")
+                break
+            # fallback: some protocols use type=34 or "audio"
+            if t in (34, "34", "voice", "audio"):
+                voice_url = (item.get("url") or item.get("voice_url") or
+                             (item.get("media_item") or {}).get("url") or "")
+                break
+
+        if voice_url:
+            log.info("Voice message, url: %s", voice_url)
+            text = transcribe_voice(voice_url)
+            if not text:
+                send_reply(from_user, ctx_token, "🎙️ 语音识别失败，请重试或发送文字")
+                return
+            # Reply with transcription + AI answer
+            memory_ctx = fetch_memory()
+            prompt = f"[用户发送了语音，转文字如下]\n{text}"
+            reply = ask_claude(prompt, system_prompt=memory_ctx)
+            full_reply = f"🎙️ 你说的是：{text}\n\n{reply}"
+            threading.Thread(target=append_history, args=(text, reply), daemon=True).start()
+            send_reply(from_user, ctx_token, full_reply)
+            return
+
+        # ── Image message (type 3 or image_item present) ──────────────────────
+        image_url = None
+        image_text = ""
+        for t, item in items:
+            ii = item.get("image_item") or item.get("imageItem") or {}
+            candidate = (ii.get("url") or ii.get("image_url") or
+                         item.get("url") or "")
+            if candidate and candidate.startswith("http"):
+                image_url = candidate
+                break
+            if t in (3, "3", "image"):
+                image_url = (item.get("url") or
+                             (item.get("image_item") or {}).get("url") or "")
+                if image_url:
+                    break
+        # Also grab any accompanying text
+        for t, item in items:
+            if t == 1:
+                image_text = (item.get("text_item") or {}).get("text", "")
+                break
+
+        if image_url:
+            log.info("Image message, url: %s", image_url)
+            memory_ctx = fetch_memory()
+            prompt_text = image_text or "请描述这张图片的内容"
+            reply = ask_claude_vision(image_url, user_text=prompt_text, system_prompt=memory_ctx)
+            threading.Thread(target=append_history,
+                             args=(f"[图片] {prompt_text}", reply), daemon=True).start()
+            send_reply(from_user, ctx_token, reply)
+            return
+
+        # ── Text message ──────────────────────────────────────────────────────
+        text = ""
+        for t, item in items:
+            if t == 1:
+                text = (item.get("text_item") or {}).get("text", "")
+                break
+
+        if not text:
+            log.info("Unknown message type, skipping: %s", [t for t, _ in items])
+            return
+
         log.info("Text from %s: %s", from_user, text)
 
+        # Detect image generation request
+        text_lower = text.lower()
+        if any(kw in text_lower for kw in IMAGE_KEYWORDS):
+            # Strip the trigger phrase to get the actual prompt
+            prompt = text
+            for kw in IMAGE_KEYWORDS:
+                prompt = prompt.replace(kw, "").strip()
+            if not prompt:
+                prompt = text  # fallback: use full text as prompt
+            send_reply(from_user, ctx_token, "🎨 正在生成图片，请稍候...")
+            img_url = generate_and_upload_image(prompt)
+            if img_url:
+                # Send image via WeChat
+                send_image(from_user, ctx_token, img_url)
+            else:
+                send_reply(from_user, ctx_token, "😔 图片生成失败，请稍后重试")
+            threading.Thread(target=append_history,
+                             args=(text, f"[已生成图片] {img_url}"), daemon=True).start()
+            return
+
+        # Normal text reply
         memory_ctx = fetch_memory()
         reply = ask_claude(text, system_prompt=memory_ctx)
         log.info("Claude reply: %.80s", reply)
-
         threading.Thread(target=append_history, args=(text, reply), daemon=True).start()
         send_reply(from_user, ctx_token, reply)
+
     except Exception as e:
         log.error("handle_message error: %s", e)
 
@@ -326,6 +540,39 @@ def _bot_url(path: str) -> str:
     if "/ilink/bot" not in burl:
         burl = burl + "/ilink/bot"
     return f"{burl}/{path.lstrip('/')}"
+
+
+def send_image(to_user: str, context_token: str, image_url: str):
+    """Send an image message via iLink sendmessage."""
+    try:
+        payload = {
+            "msg": {
+                "to_user_id":    to_user,
+                "client_id":     str(uuid.uuid4()),
+                "message_type":  2,
+                "message_state": 2,
+                "context_token": context_token,
+                "item_list": [
+                    {
+                        "type": 3,
+                        "image_item": {"url": image_url},
+                    }
+                ],
+            },
+            "base_info": {"channel_version": "1.0.0"},
+        }
+        r = httpx.post(
+            _bot_url("sendmessage"),
+            headers=bot_headers(),
+            json=payload,
+            timeout=15,
+        )
+        r.raise_for_status()
+        log.info("send_image response: %s", r.json())
+    except Exception as e:
+        log.error("send_image error: %s", e)
+        # Fallback: send URL as text
+        send_reply(to_user, context_token, f"🖼️ 图片链接：{image_url}")
 
 
 def send_reply(to_user: str, context_token: str, text: str):
