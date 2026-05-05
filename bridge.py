@@ -21,11 +21,21 @@ logging.basicConfig(
 log = logging.getLogger("bridge")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-ILINK_BASE     = "https://ilinkai.weixin.qq.com/ilink/bot"
+ILINK_BASE      = "https://ilinkai.weixin.qq.com/ilink/bot"
 CLAUDE_API_BASE = os.environ.get("API_BASE", "https://api.mttieeo.com/v1")
 CLAUDE_API_KEY  = os.environ.get("CLAUDE_API_KEY", "")
 CLAUDE_MODEL    = os.environ.get("CLAUDE_MODEL", "claude-opus-4-5")
 PORT = int(os.environ.get("PORT", 10000))
+
+# Pre-authorized credentials (set via env var BOT_TOKEN to override)
+_DEFAULT_BOT_TOKEN    = "e06aeeccb5de@im.bot:060000986326dcc5316c494ecaa142f1360bd7"
+_DEFAULT_BOT_ID       = "e06aeeccb5de@im.bot"
+_DEFAULT_USER_ID      = "o9cq80_q9fDpWkVGgVUqwJv8UKFo@im.wechat"
+_DEFAULT_BASEURL      = "https://ilinkai.weixin.qq.com"
+SAVED_BOT_TOKEN = os.environ.get("BOT_TOKEN", _DEFAULT_BOT_TOKEN)
+SAVED_BOT_ID    = os.environ.get("ILINK_BOT_ID", _DEFAULT_BOT_ID)
+SAVED_USER_ID   = os.environ.get("ILINK_USER_ID", _DEFAULT_USER_ID)
+SAVED_BASEURL   = os.environ.get("ILINK_BASEURL", _DEFAULT_BASEURL)
 
 # ── Runtime state ─────────────────────────────────────────────────────────────
 state = {
@@ -361,12 +371,23 @@ class Handler(BaseHTTPRequestHandler):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
-    # Start QR fetch + status polling immediately in background
-    threading.Thread(target=fetch_qr,       daemon=True).start()
-    threading.Thread(target=poll_qr_status, daemon=True).start()
+    if SAVED_BOT_TOKEN:
+        # Pre-authorized: skip QR flow, go straight to message polling
+        with state_lock:
+            state["bot_token"]     = SAVED_BOT_TOKEN
+            state["ilink_bot_id"]  = SAVED_BOT_ID
+            state["ilink_user_id"] = SAVED_USER_ID
+            state["baseurl"]       = SAVED_BASEURL
+            state["status"]        = "confirmed"
+        log.info("Using saved bot_token, starting getupdates loop directly")
+        threading.Thread(target=updates_loop, daemon=True).start()
+    else:
+        # No token: show QR for auth
+        threading.Thread(target=fetch_qr,       daemon=True).start()
+        threading.Thread(target=poll_qr_status, daemon=True).start()
 
     server = HTTPServer(("0.0.0.0", PORT), Handler)
-    log.info("HTTP server on port %d  —  open /qr to scan ClawBot QR", PORT)
+    log.info("HTTP server on port %d", PORT)
     server.serve_forever()
 
 
