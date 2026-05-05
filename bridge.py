@@ -22,7 +22,7 @@ log = logging.getLogger("bridge")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 ILINK_BASE      = "https://ilinkai.weixin.qq.com/ilink/bot"
-CLAUDE_API_BASE = os.environ.get("API_BASE", "https://api.mttieeo.com/v1")
+CLAUDE_API_BASE = os.environ.get("API_BASE", "https://claude-proxy.haichen940607.workers.dev/v1")
 CLAUDE_API_KEY  = os.environ.get("CLAUDE_API_KEY", "sk-UiZRa8dkAviifENhYP6sLhSp6IEf4kyA4mdaI93m7ctpfGxk")
 CLAUDE_MODEL    = os.environ.get("CLAUDE_MODEL", "claude-4-6-opus")
 PORT = int(os.environ.get("PORT", 10000))
