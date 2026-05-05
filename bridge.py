@@ -24,7 +24,7 @@ log = logging.getLogger("bridge")
 ILINK_BASE      = "https://ilinkai.weixin.qq.com/ilink/bot"
 CLAUDE_API_BASE = os.environ.get("API_BASE", "https://claude-proxy.haichen940607.workers.dev/v1")
 CLAUDE_API_KEY  = os.environ.get("CLAUDE_API_KEY", "sk-UiZRa8dkAviifENhYP6sLhSp6IEf4kyA4mdaI93m7ctpfGxk")
-CLAUDE_MODEL    = os.environ.get("CLAUDE_MODEL", "claude-4-6-opus")
+CLAUDE_MODEL    = os.environ.get("CLAUDE_MODEL", "gpt-5.4-low")
 PORT = int(os.environ.get("PORT", 10000))
 
 # Pre-authorized credentials (set via env var BOT_TOKEN to override)
@@ -247,11 +247,10 @@ def ask_claude(user_text: str) -> str:
             time.sleep(3 * attempt)   # 3s, 6s, 9s back-off
         try:
             r = httpx.post(
-                f"{CLAUDE_API_BASE}/messages",
+                f"{CLAUDE_API_BASE}/chat/completions",
                 headers={
-                    "x-api-key":         CLAUDE_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "Content-Type":      "application/json",
+                    "Authorization": f"Bearer {CLAUDE_API_KEY}",
+                    "Content-Type":  "application/json",
                 },
                 json={
                     "model":      CLAUDE_MODEL,
@@ -261,15 +260,15 @@ def ask_claude(user_text: str) -> str:
                 timeout=60,
             )
             if r.status_code == 503:
-                log.warning("Claude API 503, retry %d/4", attempt + 1)
+                log.warning("API 503, retry %d/4", attempt + 1)
                 last_err = f"503 on attempt {attempt+1}"
                 continue
             r.raise_for_status()
-            return r.json()["content"][0]["text"]
+            return r.json()["choices"][0]["message"]["content"]
         except Exception as e:
-            log.error("ask_claude attempt %d error: %s", attempt + 1, e)
+            log.error("ask_gpt attempt %d error: %s", attempt + 1, e)
             last_err = e
-    return f"[Claude 暂时不可用，请稍后再试]"
+    return f"[AI 暂时不可用，请稍后再试]"
 
 
 def _bot_url(path: str) -> str:
