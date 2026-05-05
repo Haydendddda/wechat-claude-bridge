@@ -241,26 +241,35 @@ def handle_message(msg: dict):
 
 
 def ask_claude(user_text: str) -> str:
-    try:
-        r = httpx.post(
-            f"{CLAUDE_API_BASE}/messages",
-            headers={
-                "x-api-key":         CLAUDE_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "Content-Type":      "application/json",
-            },
-            json={
-                "model":     CLAUDE_MODEL,
-                "max_tokens": 1024,
-                "messages":  [{"role": "user", "content": user_text}],
-            },
-            timeout=60,
-        )
-        r.raise_for_status()
-        return r.json()["content"][0]["text"]
-    except Exception as e:
-        log.error("ask_claude error: %s", e)
-        return f"[Claude error: {e}]"
+    last_err = None
+    for attempt in range(4):          # up to 4 tries
+        if attempt:
+            time.sleep(3 * attempt)   # 3s, 6s, 9s back-off
+        try:
+            r = httpx.post(
+                f"{CLAUDE_API_BASE}/messages",
+                headers={
+                    "x-api-key":         CLAUDE_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type":      "application/json",
+                },
+                json={
+                    "model":      CLAUDE_MODEL,
+                    "max_tokens": 1024,
+                    "messages":   [{"role": "user", "content": user_text}],
+                },
+                timeout=60,
+            )
+            if r.status_code == 503:
+                log.warning("Claude API 503, retry %d/4", attempt + 1)
+                last_err = f"503 on attempt {attempt+1}"
+                continue
+            r.raise_for_status()
+            return r.json()["content"][0]["text"]
+        except Exception as e:
+            log.error("ask_claude attempt %d error: %s", attempt + 1, e)
+            last_err = e
+    return f"[Claude 暂时不可用，请稍后再试]"
 
 
 def _bot_url(path: str) -> str:
@@ -382,6 +391,19 @@ class Handler(BaseHTTPRequestHandler):
                 snap = dict(state)
                 snap["bot_token"] = "***" if snap["bot_token"] else None
             body = json.dumps(snap, ensure_ascii=False, indent=2)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body.encode())
+
+        elif path == "/test-api":
+            # Test Claude API reachability from this server
+            import time as _t; t0 = _t.time()
+            result = ask_claude("reply with just: ok")
+            elapsed = round(_t.time() - t0, 2)
+            body = json.dumps({"result": result, "elapsed_s": elapsed,
+                               "model": CLAUDE_MODEL, "base": CLAUDE_API_BASE},
+                              ensure_ascii=False)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
