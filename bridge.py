@@ -183,7 +183,7 @@ def do_login(client: httpx.Client) -> bool:
         return ""
 
     qr_id  = extract(d, "qrcode", "ticket", "code")
-    qr_url = extract(d, "qrcode_url", "url", "link")
+    qr_url = extract(d, "qrcode_img_content", "qrcode_url", "url", "link")
 
     if not qr_url and qr_id:
         qr_url = f"https://liteapp.weixin.qq.com/q/{qr_id}?bot_type=3"
