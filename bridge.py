@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import random
+import re
 import threading
 import time
 import uuid
@@ -326,7 +327,8 @@ def ask_claude_vision(image_url: str, user_text: str = "", system_prompt: str = 
             timeout=60,
         )
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"]
+        raw = r.json()["choices"][0]["message"]["content"]
+        return strip_think_tags(raw)
     except Exception as e:
         log.error("ask_claude_vision error: %s", e)
         return "[图片理解失败，请稍后重试]"
@@ -498,6 +500,13 @@ def append_history(user_text: str, ai_reply: str):
         log.warning("append_history failed: %s", e)
 
 
+def strip_think_tags(text: str) -> str:
+    """Remove <think>...</think> reasoning blocks that some models output."""
+    # Remove <think>...</think> blocks (including multiline)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    return text.strip()
+
+
 def ask_claude(user_text: str, system_prompt: str = "") -> str:
     last_err = None
     messages = []
@@ -526,11 +535,12 @@ def ask_claude(user_text: str, system_prompt: str = "") -> str:
                 last_err = f"503 on attempt {attempt+1}"
                 continue
             r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"]
+            raw = r.json()["choices"][0]["message"]["content"]
+            return strip_think_tags(raw)
         except Exception as e:
             log.error("ask_gpt attempt %d error: %s", attempt + 1, e)
             last_err = e
-    return f"[AI 暂时不可用，请稍后再试]"
+    return "[AI 暂时不可用，请稍后再试]"
 
 
 def _bot_url(path: str) -> str:
