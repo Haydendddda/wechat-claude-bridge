@@ -25,6 +25,8 @@ ILINK_BASE      = "https://ilinkai.weixin.qq.com/ilink/bot"
 CLAUDE_API_BASE = os.environ.get("API_BASE", "https://claude-proxy.haichen940607.workers.dev/v1")
 CLAUDE_API_KEY  = os.environ.get("CLAUDE_API_KEY", "sk-UiZRa8dkAviifENhYP6sLhSp6IEf4kyA4mdaI93m7ctpfGxk")
 CLAUDE_MODEL    = os.environ.get("CLAUDE_MODEL", "gpt-5.4-low")
+MEMORY_BASE     = "https://claude-proxy.haichen940607.workers.dev"
+MEMORY_TOKEN    = os.environ.get("MEMORY_TOKEN", "mem_hguo94")
 PORT = int(os.environ.get("PORT", 10000))
 
 # Pre-authorized credentials (set via env var BOT_TOKEN to override)
@@ -232,16 +234,62 @@ def handle_message(msg: dict):
         )
         log.info("Text from %s: %s", from_user, text)
 
-        reply = ask_claude(text)
+        memory_ctx = fetch_memory()
+        reply = ask_claude(text, system_prompt=memory_ctx)
         log.info("Claude reply: %.80s", reply)
 
+        threading.Thread(target=append_history, args=(text, reply), daemon=True).start()
         send_reply(from_user, ctx_token, reply)
     except Exception as e:
         log.error("handle_message error: %s", e)
 
 
-def ask_claude(user_text: str) -> str:
+def fetch_memory() -> str:
+    """从 CF KV 取 Mac Claude 记忆 + 最近微信对话历史，拼成 system prompt。"""
+    try:
+        mac_mem = ""
+        wechat_hist = ""
+        r1 = httpx.get(f"{MEMORY_BASE}/memory?key=claude_memory", timeout=5)
+        if r1.status_code == 200:
+            mac_mem = r1.json().get("value") or ""
+        r2 = httpx.get(f"{MEMORY_BASE}/memory?key=wechat_history", timeout=5)
+        if r2.status_code == 200:
+            hist_raw = r2.json().get("value") or "[]"
+            hist = json.loads(hist_raw)
+            # 只取最近 10 条
+            recent = hist[-10:]
+            if recent:
+                lines = [f"[{h['ts'][:16]}] 用户: {h['user']}\nAI: {h['ai']}" for h in recent]
+                wechat_hist = "\n\n".join(lines)
+        parts = []
+        if mac_mem:
+            parts.append(f"【用户背景（来自 Mac Claude 记忆）】\n{mac_mem}")
+        if wechat_hist:
+            parts.append(f"【近期微信对话记录】\n{wechat_hist}")
+        return "\n\n".join(parts)
+    except Exception as e:
+        log.warning("fetch_memory failed: %s", e)
+        return ""
+
+
+def append_history(user_text: str, ai_reply: str):
+    """把这轮对话异步写入 CF KV。"""
+    try:
+        httpx.post(
+            f"{MEMORY_BASE}/memory/append",
+            json={"token": MEMORY_TOKEN, "user": user_text, "ai": ai_reply},
+            timeout=5,
+        )
+    except Exception as e:
+        log.warning("append_history failed: %s", e)
+
+
+def ask_claude(user_text: str, system_prompt: str = "") -> str:
     last_err = None
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_text})
     for attempt in range(4):          # up to 4 tries
         if attempt:
             time.sleep(3 * attempt)   # 3s, 6s, 9s back-off
@@ -255,7 +303,7 @@ def ask_claude(user_text: str) -> str:
                 json={
                     "model":      CLAUDE_MODEL,
                     "max_tokens": 1024,
-                    "messages":   [{"role": "user", "content": user_text}],
+                    "messages":   messages,
                 },
                 timeout=60,
             )
