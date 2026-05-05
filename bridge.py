@@ -314,6 +314,11 @@ class Handler(BaseHTTPRequestHandler):
                     img_url = state["qrcode_img_url"]
 
             if img_url:
+                import urllib.parse as _up
+                qr_img_src = (
+                    "https://api.qrserver.com/v1/create-qr-code/"
+                    f"?size=280x280&margin=10&data={_up.quote(img_url, safe='')}"
+                )
                 html = f"""<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
@@ -324,7 +329,7 @@ class Handler(BaseHTTPRequestHandler):
   h2{{color:#07c160}}
   .qr-wrap{{display:inline-block;border:8px solid #07c160;
             border-radius:12px;padding:10px;background:#fff;margin:20px}}
-  img{{display:block;width:260px;height:260px}}
+  img{{display:block;width:280px;height:280px}}
   p{{color:#555;font-size:14px}}
   .sub{{color:#999;font-size:12px}}
 </style>
@@ -332,7 +337,7 @@ class Handler(BaseHTTPRequestHandler):
 <h2>微信扫码授权 ClawBot</h2>
 <p>打开微信 &rarr; 扫一扫，扫描下方二维码</p>
 <div class="qr-wrap">
-  <img src="{img_url}" alt="ClawBot Auth QR">
+  <img src="{qr_img_src}" alt="ClawBot Auth QR">
 </div>
 <p class="sub">页面每5秒自动刷新 &middot; 扫码并点击「确认登录」后机器人自动上线</p>
 </body></html>"""
