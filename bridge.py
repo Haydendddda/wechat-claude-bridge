@@ -5,6 +5,7 @@ WeChat Claude Bridge
 - 直接调用 Claude API（OpenAI 兼容格式）回复
 - 支持持久记忆、对话历史
 - 内置 HTTP 健康检查（供 Render 使用）
+- /qr 端点可实时查看二维码
 """
 
 import base64
@@ -20,16 +21,16 @@ from pathlib import Path
 import httpx
 import qrcode
 
-# ─── 配置 ────────────────────────────────────────────────────────────────────
-ILINK_BASE   = "https://ilinkai.weixin.qq.com"
-API_KEY      = os.environ.get("ANTHROPIC_API_KEY", "")
-API_BASE     = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
-MODEL        = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5")
-CONFIG_DIR   = Path(os.environ.get("CONFIG_DIR", "~/.config/wechat-claude-bridge")).expanduser()
-PORT         = int(os.environ.get("PORT", "10000"))
+# ─── 配置 ─────────────────────────────────────────────────────────────────────
+ILINK_BASE    = "https://ilinkai.weixin.qq.com"
+API_KEY       = os.environ.get("ANTHROPIC_API_KEY", "")
+API_BASE      = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
+MODEL         = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5")
+CONFIG_DIR    = Path(os.environ.get("CONFIG_DIR", "~/.config/wechat-claude-bridge")).expanduser()
+PORT          = int(os.environ.get("PORT", "10000"))
 SYSTEM_PROMPT = os.environ.get("SYSTEM_PROMPT", "你是一个智能、友好的助手，回答简洁准确。")
 
-# ─── 日志 ────────────────────────────────────────────────────────────────────
+# ─── 日志 ─────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -37,11 +38,12 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ─── 状态 ────────────────────────────────────────────────────────────────────
-state    = {}          # token, cursor 等
-sessions = {}          # openid -> [{role, content}, ...]
-memories = {}          # openid -> str
-
+# ─── 状态 ─────────────────────────────────────────────────────────────────────
+state      = {}   # token, cursor 等
+sessions   = {}   # openid -> [{role, content}, ...]
+memories   = {}   # openid -> str
+current_qr_url    = ""   # 当前二维码 URL（登录前）
+current_qr_status = "waiting"  # "waiting" | "logged_in"
 
 # ─── 持久化 ──────────────────────────────────────────────────────────────────
 def cfg(name: str) -> Path:
@@ -50,6 +52,7 @@ def cfg(name: str) -> Path:
 
 
 def load_state():
+    global memories
     # 1. 从环境变量读取 token（Render 重启后自动恢复）
     b64 = os.environ.get("WECHAT_TOKEN_B64", "")
     if b64:
@@ -66,14 +69,14 @@ def load_state():
         try:
             state.update(json.loads(tf.read_text()))
             log.info("从文件恢复登录 token")
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning(f"文件 token 读取失败: {e}")
 
     # 3. 读取记忆
     mf = cfg("memory.json")
     if mf.exists():
         try:
-            memories.update(json.loads(mf.read_text()))
+            memories = json.loads(mf.read_text())
         except Exception:
             pass
 
@@ -91,14 +94,59 @@ def save_memory():
     cfg("memory.json").write_text(json.dumps(memories, ensure_ascii=False))
 
 
-# ─── 健康检查 HTTP 服务 ────────────────────────────────────────────────────────
+# ─── 健康检查 HTTP 服务 ──────────────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = b"WeChat Claude Bridge - Running"
-        self.send_response(200)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        global current_qr_url, current_qr_status
+        if self.path == "/qr":
+            if current_qr_status == "logged_in":
+                body = "<html><body><h2>✅ 已登录微信，机器人运行中！</h2></body></html>".encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif current_qr_url:
+                enc_url = current_qr_url.replace("&", "&amp;")
+                html = f"""<!DOCTYPE html>
+<html><head>
+  <meta charset="utf-8">
+  <meta http-equiv="refresh" content="10">
+  <title>WeChat 扫码登录</title>
+  <style>
+    body {{ font-family: sans-serif; text-align: center; padding: 40px; background: #f5f5f5; }}
+    .box {{ background: white; border-radius: 12px; padding: 30px; display: inline-block; box-shadow: 0 2px 12px rgba(0,0,0,.1); }}
+    img {{ border: 4px solid #07C160; border-radius: 8px; }}
+    p {{ color: #666; font-size: 14px; }}
+    a {{ color: #07C160; word-break: break-all; }}
+  </style>
+</head><body>
+  <div class="box">
+    <h2>📱 微信扫码登录</h2>
+    <img src="https://api.qrserver.com/v1/create-qr-code/?size=280x280&data={current_qr_url}" width="280" height="280" /><br>
+    <p>用微信 → 扫一扫 → 扫描上方二维码</p>
+    <p>或直接打开链接：<br><a href="{enc_url}">{enc_url}</a></p>
+    <p style="color:#aaa">页面每 10 秒自动刷新 · 二维码有效期约 4 分钟</p>
+  </div>
+</body></html>""".encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html)))
+                self.end_headers()
+                self.wfile.write(html)
+            else:
+                body = b"<html><body><p>QR code not ready yet, please refresh.</p></body></html>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        else:
+            body = b"WeChat Claude Bridge - Running"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
     def log_message(self, *_):
         pass  # 关闭 HTTP 日志
@@ -121,6 +169,7 @@ def ilink_headers() -> dict:
 
 def do_login(client: httpx.Client) -> bool:
     """扫码登录流程"""
+    global current_qr_url, current_qr_status
     # 获取二维码
     r = client.get(f"{ILINK_BASE}/ilink/bot/get_bot_qrcode", params={"bot_type": "3"})
     d = r.json()
@@ -143,12 +192,17 @@ def do_login(client: httpx.Client) -> bool:
         log.error(f"无法获取二维码 URL，响应: {d}")
         return False
 
+    # 保存 QR URL 到全局（供 /qr 端点使用）
+    current_qr_url = qr_url
+    current_qr_status = "waiting"
+
     # 显示二维码
     qr = qrcode.QRCode(border=1)
     qr.add_data(qr_url)
     qr.make(fit=True)
     qr.print_ascii(invert=True)
     log.info(f"请用微信扫描上方二维码（或打开链接）: {qr_url}")
+    log.info(f"也可访问 /qr 端点查看二维码页面")
     log.info("等待扫码...")
 
     # 轮询扫码状态
@@ -166,10 +220,12 @@ def do_login(client: httpx.Client) -> bool:
             state["token"]  = token
             state["cursor"] = ""
             save_token()
+            current_qr_status = "logged_in"
+            current_qr_url    = ""
             log.info("登录成功！")
             return True
 
-    log.error("扫码超时（2 分钟），请重启程序重试")
+    log.error("扫码超时（4 分钟），请重启程序重试")
     return False
 
 
@@ -223,12 +279,12 @@ def send_message(client: httpx.Client, to_user: str, content: str):
                 "text_item": {"content": content},
             },
         )
-        return r.json()
+        log.debug(f"发送消息响应: {r.json()}")
     except Exception as e:
-        log.error(f"sendmessage 异常: {e}")
+        log.error(f"发送消息异常: {e}")
 
 
-def parse_message(raw: dict) -> tuple[str, str]:
+def parse_message(raw: dict) -> tuple:
     """从原始消息提取发送者 ID 和文本内容"""
     sender = (
         raw.get("from_user")
@@ -251,8 +307,8 @@ def parse_message(raw: dict) -> tuple[str, str]:
     return sender, text.strip()
 
 
-# ─── Claude API ───────────────────────────────────────────────────────────────
-def handle_command(openid: str, msg: str) -> str | None:
+# ─── Claude API ──────────────────────────────────────────────────────────────
+def handle_command(openid: str, msg: str):
     """处理 / 命令，返回回复字符串；不是命令则返回 None"""
     if msg.startswith("/remember "):
         item = msg[10:].strip()
@@ -262,7 +318,7 @@ def handle_command(openid: str, msg: str) -> str | None:
 
     if msg == "/memory":
         mem = memories.get(openid, "")
-        return f"📝 我的记忆：\n{mem}" if mem else "📝 暂无记忆（用 /remember 添加）"
+        return f"📝 你的记忆：\n{mem}" if mem else "暂无记忆"
 
     if msg == "/clear":
         sessions.pop(openid, None)
@@ -270,11 +326,11 @@ def handle_command(openid: str, msg: str) -> str | None:
 
     if msg == "/help":
         return (
-            "可用命令：\n"
-            "/remember <内容> — 保存长期记忆\n"
-            "/memory — 查看所有记忆\n"
-            "/clear — 清除当前对话历史\n"
-            "/help — 显示此帮助"
+            "🤖 WeChat Claude Bridge\n"
+            "/remember <内容> - 记住某件事\n"
+            "/memory - 查看已记住的内容\n"
+            "/clear - 清除对话历史\n"
+            "/help - 显示帮助"
         )
 
     return None
@@ -311,18 +367,16 @@ def call_claude(openid: str, user_msg: str) -> str:
             )
             if r.status_code == 200:
                 reply = r.json()["choices"][0]["message"]["content"]
-                sessions[openid] = (
-                    hist + [
-                        {"role": "user",      "content": user_msg},
-                        {"role": "assistant", "content": reply},
-                    ]
-                )[-40:]
+                sessions[openid] = (hist + [
+                    {"role": "user",      "content": user_msg},
+                    {"role": "assistant", "content": reply},
+                ])[-40:]
                 return reply
-            log.warning(f"OpenAI 格式错误 {r.status_code}: {r.text[:300]}")
+            log.warning(f"OpenAI 格式失败 ({r.status_code}), 尝试 Anthropic 格式")
         except Exception as e:
-            log.debug(f"OpenAI 格式异常: {e}")
+            log.warning(f"OpenAI 格式异常: {e}, 尝试 Anthropic 格式")
 
-        # 备用：Anthropic 原生格式
+        # 回退到原生 Anthropic 格式
         try:
             r = c.post(
                 f"{API_BASE}/v1/messages",
@@ -333,28 +387,24 @@ def call_claude(openid: str, user_msg: str) -> str:
                 },
                 json={
                     "model":      MODEL,
-                    "max_tokens": 2048,
                     "system":     system,
                     "messages":   messages,
+                    "max_tokens": 2048,
                 },
             )
             if r.status_code == 200:
                 reply = r.json()["content"][0]["text"]
-                sessions[openid] = (
-                    hist + [
-                        {"role": "user",      "content": user_msg},
-                        {"role": "assistant", "content": reply},
-                    ]
-                )[-40:]
+                sessions[openid] = (hist + [
+                    {"role": "user",      "content": user_msg},
+                    {"role": "assistant", "content": reply},
+                ])[-40:]
                 return reply
-            log.error(f"Anthropic 格式错误 {r.status_code}: {r.text[:300]}")
+            return f"⚠️ API 错误 {r.status_code}: {r.text[:200]}"
         except Exception as e:
-            log.error(f"Anthropic 格式异常: {e}")
-
-    return "⚠️ API 调用失败，请检查 Render 日志"
+            return f"⚠️ API 调用异常: {e}"
 
 
-# ─── 主循环 ───────────────────────────────────────────────────────────────────
+# ─── 主循环 ──────────────────────────────────────────────────────────────────
 def main():
     load_state()
     start_health_server()
@@ -368,42 +418,33 @@ def main():
         log.info("WeChat Claude Bridge 已启动")
         log.info(f"API Base : {API_BASE}")
         log.info(f"Model    : {MODEL}")
-        log.info("监听微信消息中... (Ctrl+C 停止)")
         log.info("═" * 50)
 
-        errors = 0
         while True:
             try:
-                msgs, need_login = get_updates(client)
-
-                if need_login:
-                    state["token"] = ""
-                    log.info("重新登录中...")
+                msgs, need_relogin = get_updates(client)
+                if need_relogin:
+                    state.clear()
                     if not do_login(client):
+                        log.error("重新登录失败，60 秒后重试")
                         time.sleep(60)
                     continue
 
-                for raw in msgs or []:
-                    sender, text = parse_message(raw)
+                for raw in msgs:
+                    openid, text = parse_message(raw)
                     if not text:
                         continue
-
-                    log.info(f"← {sender[:12]}: {text[:80]}")
-                    reply = call_claude(sender, text)
-                    send_message(client, sender, reply)
-                    log.info(f"→ {sender[:12]}: {reply[:80]}")
-
-                errors = 0
-                time.sleep(0.5)
+                    log.info(f"[{openid}] {text[:80]}")
+                    reply = call_claude(openid, text)
+                    send_message(client, openid, reply)
+                    log.info(f"→ {reply[:80]}")
 
             except KeyboardInterrupt:
-                log.info("已停止")
+                log.info("退出")
                 break
             except Exception as e:
-                errors += 1
-                wait = min(30, errors * 3)
-                log.error(f"主循环异常: {e}，{wait}s 后重试")
-                time.sleep(wait)
+                log.error(f"主循环异常: {e}")
+                time.sleep(5)
 
 
 if __name__ == "__main__":
