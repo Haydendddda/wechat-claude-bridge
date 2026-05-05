@@ -173,7 +173,7 @@ def do_login(client: httpx.Client) -> bool:
     # 获取二维码
     r = client.get(f"{ILINK_BASE}/ilink/bot/get_bot_qrcode", params={"bot_type": "3"})
     d = r.json()
-    log.debug(f"QR 响应: {d}")
+    log.info(f"QR 完整响应: {d}")
 
     def extract(d, *keys):
         for k in keys:
