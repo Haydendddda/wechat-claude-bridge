@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: wechat-claude-bridge
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bridge.py
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false          # 在 Render 控制台手动填写
+      - key: ANTHROPIC_BASE_URL
+        value: https://api.mttieeo.com
+      - key: CLAUDE_MODEL
+        value: claude-sonnet-4-5
+      - key: WECHAT_TOKEN_B64
+        sync: false          # 首次扫码后从日志复制填入
+      - key: SYSTEM_PROMPT
+        value: 你是一个智能、友好的助手，回答简洁准确。
