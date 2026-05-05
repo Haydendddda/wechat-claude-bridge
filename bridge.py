@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-import base64, logging, os, threading
+"""WeChat-Claude Bridge (itchat-uos + wxsid patch)"""
+import base64, logging, os, re, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from xml.etree import ElementTree as ET
+import urllib.parse
 import httpx
-import itchat
-from itchat.content import TEXT
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -17,7 +18,85 @@ SYSTEM_PROMPT = os.environ.get("SYSTEM_PROMPT", "你是一个智能、友好的�
 qr_b64    = ""
 qr_status = "waiting"   # "waiting" | "scanned" | "logged_in"
 sessions  = {}
-memories  = {}
+
+# ── 必须先 import itchat，然后打 patch ────────────────────────────────────────
+import itchat
+from itchat.content import TEXT
+
+def _patch_itchat_wxsid():
+    """
+    Monkey-patch itchat.components.login.process_login_info
+    to fix KeyError: 'wxsid' on newer WeChat web login.
+    WeChat now returns session info in XML body, not cookies.
+    """
+    import itchat.components.login as _login_mod
+
+    def _process_login_info(core, loginContent):
+        m = re.search(r'window\.redirect_uri="(\S+?)"', loginContent)
+        if not m:
+            log.error("登录失败: 响应中未找到 redirect_uri")
+            return False
+
+        url = m.group(1)
+        core.loginInfo['url'] = url
+
+        r = core.s.get(url, allow_redirects=False)
+        core.loginInfo['url'] = url[:url.rfind('/')]
+
+        wxsid = wxuin = skey = pass_ticket = ""
+
+        # ① XML body（新版微信最常见）
+        try:
+            root = ET.fromstring(r.text)
+            def g(tag):
+                el = root.find(tag)
+                return (el.text or "").strip() if el is not None else ""
+            wxsid, wxuin = g("wxsid"), g("wxuin")
+            skey, pass_ticket = g("skey"), g("pass_ticket")
+            if wxsid:
+                log.info("登录信息: 从XML响应提取 ✓")
+        except Exception as e:
+            log.debug(f"XML解析失败: {e}")
+
+        # ② URL query 参数
+        if not wxsid:
+            try:
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+                wxsid = qs.get("sid",  [""])[0] or qs.get("wxsid",       [""])[0]
+                wxuin = qs.get("uin",  [""])[0] or qs.get("wxuin",       [""])[0]
+                skey  = qs.get("skey", [""])[0]
+                pass_ticket = qs.get("pass_ticket", [""])[0]
+                if wxsid:
+                    log.info("登录信息: 从URL参数提取 ✓")
+            except Exception as e:
+                log.debug(f"URL参数解析失败: {e}")
+
+        # ③ cookies（旧版）
+        if not wxsid:
+            ck = r.cookies
+            wxsid       = ck.get("wxsid") or ck.get("sid") or ""
+            wxuin       = ck.get("wxuin") or ck.get("uin") or ""
+            skey        = ck.get("skey")  or ""
+            pass_ticket = ck.get("pass_ticket") or ""
+            if wxsid:
+                log.info("登录信息: 从Cookie提取 ✓")
+
+        if not wxsid:
+            log.error(f"无法提取 wxsid，响应: {r.text[:400]}")
+            return False
+
+        core.loginInfo['wxsid']       = core.loginInfo['BaseRequest']['Sid']  = wxsid
+        core.loginInfo['wxuin']       = core.loginInfo['BaseRequest']['Uin']  = wxuin
+        core.loginInfo['skey']        = core.loginInfo['BaseRequest']['Skey'] = skey
+        core.loginInfo['pass_ticket'] = pass_ticket
+        log.info("process_login_info 完成")
+        return True
+
+    _login_mod.process_login_info = _process_login_info
+    log.info("itchat wxsid patch 已应用 ✓")
+
+_patch_itchat_wxsid()
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def qr_callback(uuid, status, qrcode):
@@ -94,7 +173,6 @@ def start_health_server():
 def call_claude(sender: str, text: str) -> str:
     history = sessions.setdefault(sender, [])
     history.append({"role": "user", "content": text})
-    # keep last 20 turns
     if len(history) > 40:
         history[:] = history[-40:]
     try:
@@ -119,13 +197,13 @@ def call_claude(sender: str, text: str) -> str:
         return reply
     except Exception as e:
         log.error(f"Claude API error: {e}")
-        return f"（服务暂时不可用，请稍后重试）"
+        return "（服务暂时不可用，请稍后重试）"
 
 
 @itchat.msg_register(TEXT)
 def handle_text(msg):
     sender = msg.get("FromUserName", "unknown")
-    if sender.startswith("@@"):   # ignore group messages
+    if sender.startswith("@@"):
         return
     text = msg.get("Text", "").strip()
     if not text:
@@ -133,7 +211,7 @@ def handle_text(msg):
     log.info(f"收到消息 from {sender[:8]}...: {text[:50]}")
     reply = call_claude(sender, text)
     itchat.send(reply, toUserName=sender)
-    log.info(f"已回复 {sender[:8]}...: {reply[:50]}")
+    log.info(f"已回复 {sender[:8]}...")
 
 
 def main():
