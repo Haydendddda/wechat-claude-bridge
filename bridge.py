@@ -140,9 +140,9 @@ def poll_qr_status():
         time.sleep(3)
 
 
-# ── getupdates long-poll loop ─────────────────────────────────────────────────
+# ── getupdates short-poll loop ───────────────────────────────────────────────
 def updates_loop():
-    """Long-poll getupdates; dispatch each message to handle_message."""
+    """Short-poll getupdates every 8s — avoids Render free-tier connection kills."""
     log.info("getupdates loop started")
     while True:
         with state_lock:
@@ -152,27 +152,28 @@ def updates_loop():
             burl = state["baseurl"] or ILINK_BASE
         try:
             r = httpx.post(
-                f"{burl}/getupdates",
+                f"{burl}/ilink/bot/getupdates",
                 headers=bot_headers(),
                 json={
                     "get_updates_buf": buf,
                     "base_info": {"channel_version": "1.0.0"},
                 },
-                timeout=40,
+                timeout=12,
             )
             r.raise_for_status()
             data = r.json()
 
-            # Session expired → re-login
+            # Session expired → reload saved token or re-QR
             if data.get("ret") in (-14, "-14") or data.get("errcode") in (-14, "-14"):
-                log.warning("Session expired (-14), re-logging in...")
+                log.warning("Session expired (-14), reloading saved token...")
                 with state_lock:
-                    state["status"]      = "init"
-                    state["bot_token"]   = None
+                    state["bot_token"]   = SAVED_BOT_TOKEN
                     state["updates_buf"] = ""
-                fetch_qr()
-                threading.Thread(target=poll_qr_status, daemon=True).start()
-                return
+                if not SAVED_BOT_TOKEN:
+                    fetch_qr()
+                    threading.Thread(target=poll_qr_status, daemon=True).start()
+                    return
+                continue
 
             new_buf = data.get("get_updates_buf", "")
             with state_lock:
@@ -183,10 +184,24 @@ def updates_loop():
                 threading.Thread(target=handle_message, args=(msg,), daemon=True).start()
 
         except httpx.TimeoutException:
-            pass  # normal for 35s long-poll
+            pass
         except Exception as e:
             log.error("getupdates error: %s", e)
-            time.sleep(5)
+            time.sleep(3)
+        time.sleep(2)
+
+
+def self_ping_loop():
+    """Ping our own /health every 10 min to keep Render free-tier awake."""
+    import socket
+    host = socket.gethostname()
+    own_url = f"http://0.0.0.0:{PORT}/health"
+    while True:
+        time.sleep(600)
+        try:
+            httpx.get(own_url, timeout=5)
+        except Exception:
+            pass
 
 
 # ── Message handler ───────────────────────────────────────────────────────────
@@ -248,9 +263,16 @@ def ask_claude(user_text: str) -> str:
         return f"[Claude error: {e}]"
 
 
-def send_reply(to_user: str, context_token: str, text: str):
+def _bot_url(path: str) -> str:
+    """Build full iLink bot API URL regardless of whether baseurl includes /ilink/bot."""
     with state_lock:
-        burl = state["baseurl"] or ILINK_BASE
+        burl = (state["baseurl"] or ILINK_BASE).rstrip("/")
+    if "/ilink/bot" not in burl:
+        burl = burl + "/ilink/bot"
+    return f"{burl}/{path.lstrip('/')}"
+
+
+def send_reply(to_user: str, context_token: str, text: str):
     try:
         payload = {
             "msg": {
@@ -266,7 +288,7 @@ def send_reply(to_user: str, context_token: str, text: str):
             "base_info": {"channel_version": "1.0.0"},
         }
         r = httpx.post(
-            f"{burl}/sendmessage",
+            _bot_url("sendmessage"),
             headers=bot_headers(),
             json=payload,
             timeout=15,
@@ -380,7 +402,8 @@ def main():
             state["baseurl"]       = SAVED_BASEURL
             state["status"]        = "confirmed"
         log.info("Using saved bot_token, starting getupdates loop directly")
-        threading.Thread(target=updates_loop, daemon=True).start()
+        threading.Thread(target=updates_loop,   daemon=True).start()
+        threading.Thread(target=self_ping_loop, daemon=True).start()
     else:
         # No token: show QR for auth
         threading.Thread(target=fetch_qr,       daemon=True).start()
